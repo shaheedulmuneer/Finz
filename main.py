@@ -38,15 +38,21 @@ def load_env():
 load_env()
 DB = Path(os.environ.get('DATABASE_PATH', str(ROOT / 'data' / 'finz.sqlite3')))
 if not DB.is_absolute(): DB = ROOT / DB
-DB.parent.mkdir(parents=True, exist_ok=True)
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+if not DATABASE_URL:
+    DB.parent.mkdir(parents=True, exist_ok=True)
 SECURE_COOKIE = os.environ.get('COOKIE_SECURE') == '1'
 app = FastAPI(title='FINZ AI Growth Studio', version='0.1.0', docs_url='/api/docs')
 
 @contextmanager
 def db():
-    c = sqlite3.connect(DB, timeout=30)
-    c.row_factory = sqlite3.Row
-    c.execute('PRAGMA foreign_keys=ON')
+    if DATABASE_URL:
+        from pg_adapter import PostgresConnection
+        c = PostgresConnection(DATABASE_URL)
+    else:
+        c = sqlite3.connect(DB, timeout=30)
+        c.row_factory = sqlite3.Row
+        c.execute('PRAGMA foreign_keys=ON')
     try:
         yield c
         c.commit()
@@ -309,7 +315,7 @@ def add_reel(wid:int,x:ReelIn,user=Depends(auth)):
         if not c.execute('SELECT id FROM competitors WHERE id=? AND workspace_id=?',(x.competitor_id,wid)).fetchone():raise HTTPException(404,'Competitor not found')
         try:
             c.execute('INSERT INTO reels(workspace_id,competitor_id,url,posted_at,content_type,notes,added_at) VALUES(?,?,?,?,?,?,?)',(wid,x.competitor_id,f'https://www.instagram.com{p.path}',x.posted_at,x.content_type,x.notes,utcnow()))
-        except sqlite3.IntegrityError:raise HTTPException(409,'That Reel is already in this workspace')
+        except (sqlite3.IntegrityError, __import__('psycopg').errors.UniqueViolation):raise HTTPException(409,'That Reel is already in this workspace')
     return {'ok':True}
 
 @app.delete('/api/workspaces/{wid}/reels/{rid}')
@@ -398,7 +404,10 @@ def generate(wid:int,user=Depends(auth)):
     return create_report(wid)
 
 @app.get('/api/health')
-def health():return {'ok':True,'date':today()}
+def health():
+    with db() as c:
+        c.execute('SELECT 1').fetchone()
+    return {'ok':True,'date':today(),'database':'postgresql' if DATABASE_URL else 'sqlite'}
 
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 @app.get('/')
