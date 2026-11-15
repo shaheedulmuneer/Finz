@@ -127,7 +127,8 @@ class ReelIn(BaseModel):
     notes: str = Field(default='',max_length=2000)
 
 def auth(request:Request):
-    token = request.cookies.get('finz_session')
+    authorization = request.headers.get('authorization', '')
+    token = authorization[7:].strip() if authorization.lower().startswith('bearer ') else request.cookies.get('finz_session')
     if not token: raise HTTPException(401,'Sign in required')
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     with db() as c:
@@ -171,6 +172,7 @@ def sign_session(uid,response):
     with db() as c:
         c.execute('INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),uid,expires))
     response.set_cookie('finz_session',token,httponly=True,secure=SECURE_COOKIE,samesite='lax',max_age=7*86400,path='/')
+    return token
 
 @app.post('/api/auth/login')
 def login(creds:Credentials,response:Response):
@@ -179,6 +181,43 @@ def login(creds:Credentials,response:Response):
     if not row or not valid_pw(creds.password,row['password_hash']): raise HTTPException(401,'Incorrect email or password')
     sign_session(row['id'],response)
     return {'email':row['email']}
+
+# Dedicated mobile sessions. The bearer token is returned only to the
+# authenticated client and must be kept in the OS secure credential store.
+@app.post('/api/mobile/auth/login')
+def mobile_login(creds:Credentials,response:Response):
+    with db() as c:
+        row=c.execute('SELECT * FROM users WHERE email=?',(creds.email.strip().lower(),)).fetchone()
+    if not row or not valid_pw(creds.password,row['password_hash']):
+        raise HTTPException(401,'Incorrect email or password')
+    token=sign_session(row['id'],response)
+    return {'email':row['email'],'token':token,'expires_in':7*86400}
+
+@app.post('/api/mobile/auth/register')
+def mobile_register(creds:Credentials,response:Response):
+    email=creds.email.strip().lower()
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+',email):
+        raise HTTPException(400,'Valid email required')
+    if len(creds.password)<10:
+        raise HTTPException(400,'Password must have at least 10 characters')
+    with db() as c:
+        if c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone():
+            raise HTTPException(409,'Email already registered')
+        c.execute('INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)',
+                  (email,hash_pw(creds.password),utcnow()))
+        uid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+    token=sign_session(uid,response)
+    return {'email':email,'token':token,'expires_in':7*86400}
+
+@app.post('/api/mobile/auth/logout')
+def mobile_logout(request:Request):
+    authorization=request.headers.get('authorization','')
+    if authorization.lower().startswith('bearer '):
+        token=authorization[7:].strip()
+        with db() as c:
+            c.execute('DELETE FROM sessions WHERE token_hash=?',
+                      (hashlib.sha256(token.encode()).hexdigest(),))
+    return {'ok':True}
 
 @app.post('/api/auth/logout')
 def logout(response:Response,request:Request):
