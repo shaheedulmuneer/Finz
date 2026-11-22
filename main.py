@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File, Depends
 from fastapi.responses import FileResponse
@@ -151,7 +151,8 @@ async def origin_protection(request:Request,call_next):
             from urllib.parse import urlparse
             o=urlparse(origin)
             host=request.headers.get('host','').split(':')[0]
-            if o.hostname != host: return Response('Origin not allowed',status_code=403)
+            # Apple posts its sign-in result from appleid.apple.com; that callback is protected by its one-time state instead.
+            if o.hostname != host and not (request.url.path.startswith('/api/auth/') and request.url.path.endswith('/callback')): return Response('Origin not allowed',status_code=403)
     return await call_next(request)
 
 @app.post('/api/auth/register')
@@ -226,6 +227,123 @@ def logout(response:Response,request:Request):
         with db() as c: c.execute('DELETE FROM sessions WHERE token_hash=?',(hashlib.sha256(token.encode()).hexdigest(),))
     response.delete_cookie('finz_session',path='/')
     return {'ok':True}
+
+# ===== Social sign-in: Google, Apple, Facebook =====
+# Env: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET | FACEBOOK_APP_ID, FACEBOOK_APP_SECRET |
+#      APPLE_CLIENT_ID (Services ID), APPLE_TEAM_ID, APPLE_KEY_ID, APPLE_PRIVATE_KEY (.p8 contents). Optional: PUBLIC_BASE_URL.
+SOCIAL={
+ 'google':{'env':('GOOGLE_CLIENT_ID','GOOGLE_CLIENT_SECRET'),'auth':'https://accounts.google.com/o/oauth2/v2/auth','scope':'openid email profile'},
+ 'facebook':{'env':('FACEBOOK_APP_ID','FACEBOOK_APP_SECRET'),'auth':'https://www.facebook.com/v25.0/dialog/oauth','scope':'email,public_profile'},
+ 'apple':{'env':('APPLE_CLIENT_ID','APPLE_TEAM_ID','APPLE_KEY_ID','APPLE_PRIVATE_KEY'),'auth':'https://appleid.apple.com/auth/authorize','scope':'name email'},
+}
+SOCIAL_NAMES={'google':'Google','facebook':'Facebook','apple':'Apple'}
+def social_on(p): return p in SOCIAL and all(os.environ.get(k,'').strip() for k in SOCIAL[p]['env'])
+def public_base(request:Request):
+    env=os.environ.get('PUBLIC_BASE_URL','').strip().rstrip('/')
+    if env: return env
+    host=request.headers.get('x-forwarded-host') or request.headers.get('host','')
+    proto='http' if host.startswith(('localhost','127.0.0.1')) else 'https'
+    return f'{proto}://{host}'
+def social_redirect_uri(request,p): return public_base(request)+f'/api/auth/{p}/callback'
+def init_social_tables():
+    with db() as c:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS user_identities(provider TEXT NOT NULL, subject TEXT NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, email TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, PRIMARY KEY(provider,subject));
+        CREATE TABLE IF NOT EXISTS login_states(state_hash TEXT PRIMARY KEY, provider TEXT NOT NULL, expires_at TEXT NOT NULL);
+        ''')
+init_social_tables()
+def _b64url(b:bytes)->str:
+    import base64
+    return base64.urlsafe_b64encode(b).rstrip(b'=').decode()
+def _jwt_payload(token:str)->dict:
+    import base64
+    part=token.split('.')[1]; part+='='*(-len(part)%4)
+    return json.loads(base64.urlsafe_b64decode(part))
+def apple_client_secret():
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+    pem=os.environ['APPLE_PRIVATE_KEY'].replace('\\n','\n').strip().encode()
+    key=serialization.load_pem_private_key(pem,password=None)
+    now=int(datetime.now(timezone.utc).timestamp())
+    head=_b64url(json.dumps({'alg':'ES256','kid':os.environ['APPLE_KEY_ID']}).encode())
+    body=_b64url(json.dumps({'iss':os.environ['APPLE_TEAM_ID'],'iat':now,'exp':now+3000,'aud':'https://appleid.apple.com','sub':os.environ['APPLE_CLIENT_ID']}).encode())
+    r,s=decode_dss_signature(key.sign(f'{head}.{body}'.encode(),ec.ECDSA(hashes.SHA256())))
+    return f'{head}.{body}.'+_b64url(r.to_bytes(32,'big')+s.to_bytes(32,'big'))
+
+@app.get('/api/auth/providers')
+def auth_providers(): return {p:social_on(p) for p in SOCIAL}
+
+@app.get('/api/auth/{provider}/start',include_in_schema=False)
+def social_start(provider:str,request:Request):
+    from fastapi.responses import RedirectResponse
+    from urllib.parse import urlencode
+    if not social_on(provider): return RedirectResponse('/?login_error='+quote_plus(f'{SOCIAL_NAMES.get(provider,provider)} sign-in is not set up yet'),status_code=303)
+    state=secrets.token_urlsafe(32)
+    with db() as c:
+        c.execute('DELETE FROM login_states WHERE expires_at<?',(utcnow(),))
+        c.execute('INSERT INTO login_states(state_hash,provider,expires_at) VALUES(?,?,?)',(hashlib.sha256(state.encode()).hexdigest(),provider,(datetime.now(timezone.utc)+timedelta(minutes=15)).isoformat(timespec='seconds')))
+    cfg=SOCIAL[provider];cid=os.environ[cfg['env'][0]]
+    q={'client_id':cid,'redirect_uri':social_redirect_uri(request,provider),'response_type':'code','scope':cfg['scope'],'state':state}
+    if provider=='google': q['prompt']='select_account'
+    if provider=='apple': q['response_mode']='form_post'
+    return RedirectResponse(cfg['auth']+'?'+urlencode(q),status_code=303)
+
+def social_identity(provider,code,request):
+    """Exchange the code with the provider and return (subject, email, email_verified)."""
+    redirect=social_redirect_uri(request,provider)
+    if provider=='google':
+        r=httpx.post('https://oauth2.googleapis.com/token',data={'code':code,'client_id':os.environ['GOOGLE_CLIENT_ID'],'client_secret':os.environ['GOOGLE_CLIENT_SECRET'],'redirect_uri':redirect,'grant_type':'authorization_code'},timeout=20)
+        if r.status_code!=200: raise ValueError('Google did not accept the sign-in')
+        r=httpx.get('https://openidconnect.googleapis.com/v1/userinfo',headers={'Authorization':'Bearer '+r.json()['access_token']},timeout=20)
+        if r.status_code!=200: raise ValueError('Could not read your Google account')
+        u=r.json(); return str(u['sub']),(u.get('email') or '').lower(),bool(u.get('email_verified'))
+    if provider=='facebook':
+        r=httpx.get('https://graph.facebook.com/v25.0/oauth/access_token',params={'client_id':os.environ['FACEBOOK_APP_ID'],'client_secret':os.environ['FACEBOOK_APP_SECRET'],'redirect_uri':redirect,'code':code},timeout=20)
+        if r.status_code!=200: raise ValueError('Facebook did not accept the sign-in')
+        r=httpx.get('https://graph.facebook.com/v25.0/me',params={'fields':'id,email','access_token':r.json()['access_token']},timeout=20)
+        if r.status_code!=200: raise ValueError('Could not read your Facebook account')
+        u=r.json(); return str(u['id']),(u.get('email') or '').lower(),bool(u.get('email'))
+    if provider=='apple':
+        r=httpx.post('https://appleid.apple.com/auth/token',data={'client_id':os.environ['APPLE_CLIENT_ID'],'client_secret':apple_client_secret(),'code':code,'grant_type':'authorization_code','redirect_uri':redirect},timeout=20)
+        if r.status_code!=200: raise ValueError('Apple did not accept the sign-in')
+        u=_jwt_payload(r.json()['id_token'])
+        if u.get('iss')!='https://appleid.apple.com' or u.get('aud')!=os.environ['APPLE_CLIENT_ID']: raise ValueError('Apple sign-in could not be verified')
+        return str(u['sub']),(u.get('email') or '').lower(),str(u.get('email_verified')).lower()=='true'
+    raise ValueError('Unknown sign-in provider')
+
+@app.api_route('/api/auth/{provider}/callback',methods=['GET','POST'],include_in_schema=False)
+async def social_callback(provider:str,request:Request):
+    from fastapi.responses import RedirectResponse
+    params=dict(request.query_params)
+    if request.method=='POST': params.update({k:str(v) for k,v in (await request.form()).items()})
+    name=SOCIAL_NAMES.get(provider,provider)
+    def fail(msg): return RedirectResponse('/?login_error='+quote_plus(msg[:200]),status_code=303)
+    if params.get('error'): return fail(f'{name} sign-in was cancelled')
+    code,state=params.get('code',''),params.get('state','')
+    if not social_on(provider) or not code or not state: return fail(f'{name} sign-in did not finish. Please try again.')
+    sh=hashlib.sha256(state.encode()).hexdigest()
+    with db() as c:
+        st=c.execute('SELECT provider FROM login_states WHERE state_hash=? AND expires_at>?',(sh,utcnow())).fetchone()
+        c.execute('DELETE FROM login_states WHERE state_hash=?',(sh,))
+    if not st or st['provider']!=provider: return fail('This sign-in link expired. Please try again.')
+    try: subject,email,verified=social_identity(provider,code,request)
+    except (httpx.HTTPError,ValueError,KeyError) as e: return fail(str(e) if isinstance(e,ValueError) else f'Could not reach {name}. Please try again.')
+    with db() as c:
+        row=c.execute('SELECT user_id FROM user_identities WHERE provider=? AND subject=?',(provider,subject)).fetchone()
+        if row: uid=row['user_id']
+        else:
+            if not email: return fail(f'Your {name} account did not share an email address. Please sign in with email instead.')
+            if not verified: return fail(f'Please verify your email with {name} first, or sign in with email.')
+            u=c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone()
+            if u: uid=u['id']
+            else:
+                c.execute('INSERT INTO users(email,password_hash,created_at) VALUES(?,?,?)',(email,'social$'+secrets.token_hex(32),utcnow()))
+                uid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+            c.execute('INSERT INTO user_identities(provider,subject,user_id,email,created_at) VALUES(?,?,?,?,?)',(provider,subject,uid,email,utcnow()))
+    resp=RedirectResponse('/',status_code=303)
+    sign_session(uid,resp)
+    return resp
 
 @app.get('/api/me')
 def me(user=Depends(auth)): return user
