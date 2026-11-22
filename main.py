@@ -568,6 +568,95 @@ def enhance_with_ai(wid:int,user=Depends(auth)):
         c.execute('UPDATE reports SET data=?,created_at=? WHERE workspace_id=? AND day=?',(json.dumps(report),utcnow(),wid,today()))
     return report
 
+# ===== AI Studio: content creation =====
+AI_KINDS={
+ 'reel':'Instagram Reel script: a scroll-stopping hook for the first 3 seconds, then numbered shots (what to film, on-screen text), ideal length, and the caption',
+ 'caption':'Instagram feed post caption',
+ 'carousel':'Instagram carousel: slide-by-slide text (Slide 1 is the hook, last slide is the call to action)',
+ 'story':'Instagram Story sequence: frame-by-frame ideas using polls, questions or countdown stickers',
+ 'calendar':'7-day content plan: one post idea per day (Day 1 to Day 7), mixing Reels, carousels and Stories',
+ 'facebook':'Facebook Page post',
+ 'tiktok':'TikTok video script: hook, numbered shots, trending-style format suggestion and caption',
+ 'whatsapp':'WhatsApp broadcast message to existing customers who opted in: short, friendly, one clear call to action, no spammy wording',
+}
+AI_SCHEMA={'type':'object','additionalProperties':False,'required':['items'],'properties':{'items':{'type':'array','items':{'type':'object','additionalProperties':False,
+  'required':['title','hook','body','caption','hashtags','call_to_action','why'],
+  'properties':{'title':{'type':'string'},'hook':{'type':'string'},'body':{'type':'string'},'caption':{'type':'string'},'hashtags':{'type':'array','items':{'type':'string'}},'call_to_action':{'type':'string'},'why':{'type':'string'}}}}}}
+class ContentIn(BaseModel):
+    kind: str = Field(max_length=20)
+    topic: str = Field(default='',max_length=600)
+    tone: str = Field(default='Friendly',max_length=40)
+    language: str = Field(default='English',max_length=40)
+    count: int = Field(default=3,ge=1,le=5)
+def init_ai_tables():
+    with db() as c:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS ai_contents(id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, user_id INTEGER NOT NULL, kind TEXT NOT NULL, params TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_ai_contents ON ai_contents(workspace_id,created_at);
+        ''')
+init_ai_tables()
+def ai_context(wid:int,ws:dict):
+    start=(local_date()-timedelta(days=29)).isoformat()
+    with db() as c:
+        rows=[dict(r) for r in c.execute('SELECT * FROM metrics WHERE workspace_id=? AND day>=?',(wid,start))]
+        comps=[r['name'] for r in c.execute('SELECT name FROM competitors WHERE workspace_id=?',(wid,))]
+    tot={k:int(sum(float(r[k] or 0) for r in rows)) for k in ('views','reach','likes','comments','shares','saves','inquiries','bookings')}
+    posts=sorted([r for r in rows if r['post_title'] and 'daily total' not in r['post_title'].lower()],key=lambda r:r['views'] or 0,reverse=True)
+    top=[{'title':r['post_title'][:120],'platform':r['platform'],'views':r['views'],'likes':r['likes'],'saves':r['saves'],'shares':r['shares']} for r in posts[:5]]
+    return {'business':{'name':ws['name'],'industry':ws.get('industry',''),'location':ws.get('location','')},'last_30_days_totals':tot if rows else 'No data uploaded yet','best_posts':top,'competitors':comps[:10],'uses_demo_data':any(r['source']=='DEMO' for r in rows)}
+
+@app.post('/api/workspaces/{wid}/ai/content')
+def ai_content(wid:int,x:ContentIn,user=Depends(auth)):
+    ws=allow_workspace(wid,user)
+    if x.kind not in AI_KINDS: raise HTTPException(400,'Unknown content type')
+    key=os.environ.get('OPENAI_API_KEY','').strip()
+    if not key: raise HTTPException(400,'AI is not set up yet. Add OPENAI_API_KEY to the server settings.')
+    limit=int(os.environ.get('AI_DAILY_LIMIT','40'))
+    with db() as c:
+        used=c.execute('SELECT COUNT(*) n FROM ai_contents WHERE workspace_id=? AND created_at>=?',(wid,(datetime.now(timezone.utc)-timedelta(days=1)).isoformat(timespec='seconds'))).fetchone()['n']
+    if used>=limit: raise HTTPException(429,f'Daily AI limit reached ({limit} per client per day). Try again tomorrow.')
+    count=7 if x.kind=='calendar' else x.count
+    instructions=('You are an expert social media strategist creating ready-to-post content for a business. '
+        f'Write in {x.language}. Tone: {x.tone}. Create exactly {count} different item(s) of this type: {AI_KINDS[x.kind]}. '
+        'Use the business details and performance data provided: lean into what their best posts have in common. '
+        'Never invent statistics, prices, offers, awards or customer quotes that were not given; use clear placeholders like [price] or [date] instead. '
+        'Do not copy competitors. Keep it suitable for the platform and its rules. '
+        'Field guide: title = short name for the idea; hook = the first line or first 3 seconds; body = the full script, slides, frames or message (use line breaks and numbering); '
+        'caption = the ready-to-paste caption (empty string for WhatsApp); hashtags = 5 to 12 relevant hashtags without spaces (empty list for WhatsApp); '
+        'call_to_action = one clear action; why = one sentence on why this should work for this business.')
+    payload={'request':{'content_type':x.kind,'topic_or_goal':x.topic or 'Choose the best topic for this business right now'},'context':ai_context(wid,ws)}
+    model=os.environ.get('OPENAI_MODEL','gpt-4.1-mini')
+    try:
+        with httpx.Client(timeout=60) as client:
+            r=client.post('https://api.openai.com/v1/responses',headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'},json={
+                'model':model,'instructions':instructions,'input':json.dumps(payload,ensure_ascii=False),'max_output_tokens':3500,
+                'text':{'format':{'type':'json_schema','name':'content_items','schema':AI_SCHEMA,'strict':True}}})
+            r.raise_for_status()
+            data=r.json()
+        text=''.join(item.get('text','') for out in data.get('output',[]) for item in out.get('content',[]) if item.get('type')=='output_text').strip()
+        items=json.loads(text)['items']
+        if not items: raise ValueError('empty')
+    except (httpx.HTTPError,ValueError,KeyError,TypeError) as ex:
+        raise HTTPException(502,'The AI could not create content right now. Please try again.') from ex
+    params={'kind':x.kind,'topic':x.topic,'tone':x.tone,'language':x.language,'count':count,'model':model}
+    with db() as c:
+        c.execute('INSERT INTO ai_contents(workspace_id,user_id,kind,params,data,created_at) VALUES(?,?,?,?,?,?)',(wid,user['id'],x.kind,json.dumps(params),json.dumps(items,ensure_ascii=False),utcnow()))
+        cid=c.execute('SELECT MAX(id) FROM ai_contents WHERE workspace_id=?',(wid,)).fetchone()[0]
+    return {'id':cid,'params':params,'items':items,'created_at':utcnow(),'used_today':used+1,'daily_limit':limit}
+
+@app.get('/api/workspaces/{wid}/ai/content')
+def ai_content_history(wid:int,user=Depends(auth)):
+    allow_workspace(wid,user)
+    with db() as c:
+        rows=[dict(r) for r in c.execute('SELECT * FROM ai_contents WHERE workspace_id=? ORDER BY id DESC LIMIT 20',(wid,))]
+    return {'enabled':bool(os.environ.get('OPENAI_API_KEY','').strip()),'history':[{'id':r['id'],'params':json.loads(r['params']),'items':json.loads(r['data']),'created_at':r['created_at']} for r in rows]}
+
+@app.delete('/api/workspaces/{wid}/ai/content/{cid}')
+def ai_content_delete(wid:int,cid:int,user=Depends(auth)):
+    allow_workspace(wid,user)
+    with db() as c: c.execute('DELETE FROM ai_contents WHERE workspace_id=? AND id=?',(wid,cid))
+    return {'ok':True}
+
 @app.get('/api/workspaces/{wid}/reports')
 def reports(wid:int,user=Depends(auth)):
     allow_workspace(wid,user)
