@@ -209,3 +209,18 @@ footer{border-top-color:rgba(255,255,255,.07)}
 .social-btn.facebook{background:#1877f2;color:#fff;border-color:#1877f2}
 .or-line{display:flex;align-items:center;gap:12px;color:#7d84a0;font-size:12px;margin:8px 0 0}
 .or-line:before,.or-line:after{content:"";flex:1;height:1px;background:#2f3448}
+/* Instagram top posts */
+.post-tips{display:grid;gap:4px;margin:4px 0 14px;color:#d6d9ea;font-size:13.5px}
+.post-tips p{margin:0}
+.post-tips b{color:#ffb27d}
+.post-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px}
+.post-card{display:block;border:1px solid #2c3146;border-radius:14px;overflow:hidden;background:#0d1020;color:inherit;text-decoration:none;transition:transform .15s,border-color .15s}
+.post-card:hover{transform:translateY(-2px);border-color:#ff8a3d}
+.post-thumb{position:relative;aspect-ratio:4/5;background:linear-gradient(135deg,#2a1f3d,#3a2416)}
+.post-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.post-kind{position:absolute;top:8px;left:8px;font-size:10px;font-weight:700;background:#000a;color:#fff;padding:4px 8px;border-radius:99px}
+.post-meta{padding:10px 11px 12px}
+.post-meta p{margin:0 0 8px;font-size:12.5px;line-height:1.4;color:#e6e8f3;min-height:34px}
+.post-nums{display:flex;flex-wrap:wrap;gap:8px;font-size:11.5px;color:#aab0c8}
+.post-meta small{display:block;margin-top:6px;color:#7d84a0;font-size:11px}
+@media(max-width:600px){.post-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.post-meta p{font-size:12px}.post-nums{gap:6px;font-size:11px}}
