@@ -617,7 +617,10 @@ def sync_instagram(wid:int,days:int=30):
         c.execute('DELETE FROM metrics WHERE workspace_id=? AND source=? AND day>=?',(wid,'INSTAGRAM_API',(local_date()-timedelta(days=days)).isoformat()))
         c.executemany('''INSERT INTO metrics(workspace_id,day,platform,post_title,views,reach,likes,comments,shares,saves,profile_visits,inquiries,bookings,revenue,source,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',rows)
         c.execute('UPDATE oauth_connections SET last_sync_at=?,last_sync_status=? WHERE id=?',(utcnow(),'OK' if not errors else 'Partly synced',conn['id']))
-    return {'days':len(rows),'warnings':errors[:3]}
+    posts=0
+    try: posts=sync_instagram_posts(wid,conn,token)
+    except Exception as e: errors.append('Posts: '+str(e)[:150])
+    return {'days':len(rows),'posts':posts,'warnings':errors[:3]}
 
 @app.post('/api/workspaces/{wid}/sync/instagram')
 def sync_instagram_now(wid:int,user=Depends(auth)):
@@ -686,6 +689,82 @@ def enhance_with_ai(wid:int,user=Depends(auth)):
         c.execute('UPDATE reports SET data=?,created_at=? WHERE workspace_id=? AND day=?',(json.dumps(report),utcnow(),wid,today()))
     return report
 
+# ===== Instagram per-post results =====
+def init_post_tables():
+    with db() as c:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS ig_posts(workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, media_id TEXT NOT NULL, posted_at TEXT NOT NULL, media_type TEXT NOT NULL DEFAULT '', product_type TEXT NOT NULL DEFAULT '', caption TEXT NOT NULL DEFAULT '', permalink TEXT NOT NULL DEFAULT '', thumbnail TEXT NOT NULL DEFAULT '', views INTEGER DEFAULT 0, reach INTEGER DEFAULT 0, likes INTEGER DEFAULT 0, comments INTEGER DEFAULT 0, shares INTEGER DEFAULT 0, saves INTEGER DEFAULT 0, interactions INTEGER DEFAULT 0, synced_at TEXT NOT NULL, PRIMARY KEY(workspace_id,media_id));
+        CREATE INDEX IF NOT EXISTS idx_ig_posts ON ig_posts(workspace_id,posted_at);
+        ''')
+init_post_tables()
+IG_POST_METRICS=['views','reach','likes','comments','shares','saved','total_interactions']
+def sync_instagram_posts(wid:int,conn:dict,token:str,days:int=90,max_posts:int=100):
+    cutoff=datetime.now(timezone.utc)-timedelta(days=days)
+    media=[];url=f"{IG_GRAPH}/{conn['external_account_id']}/media"
+    params={'fields':'id,caption,media_type,media_product_type,timestamp,permalink,like_count,comments_count,thumbnail_url,media_url','limit':50,'access_token':token}
+    while url and len(media)<max_posts:
+        r=httpx.get(url,params=params,timeout=25)
+        if r.status_code!=200: raise ValueError(ig_error(r))
+        j=r.json();page=j.get('data',[]);stop=False
+        for m in page:
+            try: ts=datetime.strptime(m['timestamp'],'%Y-%m-%dT%H:%M:%S%z')
+            except Exception: continue
+            if ts<cutoff: stop=True;break
+            media.append((m,ts))
+        url=None if stop else (j.get('paging') or {}).get('next');params=None
+    def insights(item):
+        m,ts=item
+        vals={'likes':m.get('like_count') or 0,'comments':m.get('comments_count') or 0}
+        if m.get('media_product_type')=='STORY': return m,ts,vals
+        for metrics in (IG_POST_METRICS,['reach','likes','comments','shares','saved']):
+            try:
+                r=httpx.get(f"{IG_GRAPH}/{m['id']}/insights",params={'metric':','.join(metrics),'access_token':token},timeout=20)
+                if r.status_code==200:
+                    for x in r.json().get('data',[]):
+                        v=(x.get('values') or [{}])[0].get('value',(x.get('total_value') or {}).get('value',0))
+                        vals[x.get('name')]=int(v or 0)
+                    break
+            except httpx.HTTPError: pass
+        return m,ts,vals
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex: done=list(ex.map(insights,media))
+    rows=[]
+    for m,ts,v in done:
+        thumb=m.get('thumbnail_url') or (m.get('media_url') if m.get('media_type')!='VIDEO' else '') or ''
+        rows.append((wid,m['id'],ts.astimezone(ZoneInfo('Asia/Dubai')).isoformat(timespec='minutes'),m.get('media_type',''),m.get('media_product_type',''),(m.get('caption') or '')[:2200],m.get('permalink',''),thumb,v.get('views',0),v.get('reach',0),v.get('likes',0),v.get('comments',0),v.get('shares',0),v.get('saved',0),v.get('total_interactions',0),utcnow()))
+    with db() as c:
+        for row in rows:
+            c.execute('DELETE FROM ig_posts WHERE workspace_id=? AND media_id=?',(row[0],row[1]))
+        c.executemany('INSERT INTO ig_posts(workspace_id,media_id,posted_at,media_type,product_type,caption,permalink,thumbnail,views,reach,likes,comments,shares,saves,interactions,synced_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',rows)
+    return len(rows)
+
+def post_kind(p):
+    if p['product_type']=='REELS': return 'Reel'
+    if p['media_type']=='CAROUSEL_ALBUM': return 'Carousel'
+    if p['media_type']=='VIDEO': return 'Video'
+    return 'Photo'
+
+@app.get('/api/workspaces/{wid}/posts')
+def instagram_posts(wid:int,days:int=90,user=Depends(auth)):
+    allow_workspace(wid,user)
+    days=min(max(days,7),365)
+    start=(local_date()-timedelta(days=days-1)).isoformat()
+    with db() as c:
+        rows=[dict(r) for r in c.execute('SELECT * FROM ig_posts WHERE workspace_id=? AND posted_at>=? ORDER BY posted_at DESC',(wid,start))]
+    for r in rows:
+        r['kind']=post_kind(r)
+        r['score']=r['views'] or r['reach'] or (r['likes']+r['comments'])
+    by_kind={}
+    for r in rows: by_kind.setdefault(r['kind'],[]).append(r['score'])
+    kinds=sorted([{'kind':k,'posts':len(v),'avg_views':round(sum(v)/len(v))} for k,v in by_kind.items()],key=lambda x:-x['avg_views'])
+    names=['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];by_day={}
+    for r in rows:
+        try: by_day.setdefault(datetime.fromisoformat(r['posted_at']).weekday(),[]).append(r['score'])
+        except ValueError: pass
+    days_rank=sorted([{'day':names[d],'posts':len(v),'avg_views':round(sum(v)/len(v))} for d,v in by_day.items() if len(v)>=2],key=lambda x:-x['avg_views'])
+    top=sorted(rows,key=lambda r:-r['score'])
+    return {'count':len(rows),'top':top[:12],'recent':rows[:12],'by_kind':kinds,'best_days':days_rank[:3]}
+
 # ===== AI Studio: content creation =====
 AI_KINDS={
  'reel':'Instagram Reel script: a scroll-stopping hook for the first 3 seconds, then numbered shots (what to film, on-screen text), ideal length, and the caption',
@@ -721,6 +800,9 @@ def ai_context(wid:int,ws:dict):
     tot={k:int(sum(float(r[k] or 0) for r in rows)) for k in ('views','reach','likes','comments','shares','saves','inquiries','bookings')}
     posts=sorted([r for r in rows if r['post_title'] and 'daily total' not in r['post_title'].lower()],key=lambda r:r['views'] or 0,reverse=True)
     top=[{'title':r['post_title'][:120],'platform':r['platform'],'views':r['views'],'likes':r['likes'],'saves':r['saves'],'shares':r['shares']} for r in posts[:5]]
+    with db() as c:
+        igp=[dict(r) for r in c.execute('SELECT * FROM ig_posts WHERE workspace_id=? AND posted_at>=? ORDER BY views DESC, reach DESC LIMIT 8',(wid,(local_date()-timedelta(days=90)).isoformat()))]
+    if igp: top=[{'caption':p['caption'][:160],'type':post_kind(p),'posted':p['posted_at'][:10],'views':p['views'],'reach':p['reach'],'likes':p['likes'],'saves':p['saves'],'shares':p['shares'],'comments':p['comments']} for p in igp]
     return {'business':{'name':ws['name'],'industry':ws.get('industry',''),'location':ws.get('location','')},'last_30_days_totals':tot if rows else 'No data uploaded yet','best_posts':top,'competitors':comps[:10],'uses_demo_data':any(r['source']=='DEMO' for r in rows)}
 
 @app.post('/api/workspaces/{wid}/ai/content')
