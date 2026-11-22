@@ -385,20 +385,20 @@ def create_report(wid:int):
     recent_inq=sumk(recent,'inquiries');prior_inq=sumk(prior,'inquiries')
     recs=[]
     if not rows:
-        recs.append({'title':'Import performance data','detail':'Upload an Instagram or marketing CSV to unlock evidence-based comparisons.','priority':'High'})
+        recs.append({'title':'Upload your numbers first','detail':'Go to Upload Data and add your Instagram results. Then FINZ can give you ideas based on your real numbers.','priority':'High'})
     else:
         if prior_views>0 and recent_views<prior_views*.9:
-            recs.append({'title':'Review declining reach','detail':f'Views decreased {round((1-recent_views/prior_views)*100)}% across the comparable 7-day periods. Audit first 3 seconds and sharing patterns.','priority':'High'})
+            recs.append({'title':'Your views went down','detail':f'You got {round((1-recent_views/prior_views)*100)}% fewer views than last week. Make the first 3 seconds of your next Reel more exciting so people keep watching.','priority':'High'})
         if sumk(recent,'inquiries')<max(3,sumk(recent,'profile_visits')*.03):
-            recs.append({'title':'Improve profile-to-inquiry conversion','detail':'Test a clear booking link, pinned pricing Reel and Story CTA. Check actual qualified inquiries.','priority':'High'})
+            recs.append({'title':'Turn visitors into customers','detail':'People visit your profile but few ask about you. Add a clear booking link, pin a Reel that shows your prices, and add a "Book now" button to your Stories.','priority':'High'})
         if prior_inq and recent_inq>prior_inq*1.1:
-            recs.append({'title':'Build on inquiry growth','detail':'Inquiries rose compared with the prior week. Review which posts generated conversations and test follow-up variations.','priority':'Medium'})
+            recs.append({'title':'More people are asking about you','detail':'You got more enquiries than last week. Find the posts that started those chats and make more posts like them.','priority':'Medium'})
         if sumk(recent,'bookings')==0:
-            recs.append({'title':'Track confirmed bookings','detail':'No bookings appear in the uploaded recent data. Add booking-attribution data to measure real business outcomes.','priority':'High'})
+            recs.append({'title':'Add your bookings','detail':'Your upload has no bookings yet. Add the bookings column so you can see which posts bring real customers.','priority':'High'})
     if len(new_reels):
-        recs.append({'title':'Review fresh competitor Reels','detail':f'{len(new_reels)} verified-link entries have dates in the last two calendar days. Look for repeatable formats, not copied footage.','priority':'Medium'})
-    recs.extend([{'title':'Test a real customer moment','detail':'Film a 10–18 second reaction-led Reel; start with the funniest moment and add a clear local booking CTA.','priority':'Medium'},
-                 {'title':'Create one booking-first post','detail':'Promote a birthday, date-night or team-building offer using a trackable booking link.','priority':'Medium'}])
+        recs.append({'title':'Check new competitor Reels','detail':f'You saved {len(new_reels)} competitor Reels from the last 2 days. Look at what made them work and try the same idea in your own style. Don\'t copy their video.','priority':'Medium'})
+    recs.extend([{'title':'Film a real customer moment','detail':'Make a short Reel (10–18 seconds) of customers having fun. Start with the funniest moment and end with "Book your table" or a similar message.','priority':'Medium'},
+                 {'title':'Post one special offer','detail':'Share an offer for birthdays, date nights or team outings, with a booking link so you can see how many people book from it.','priority':'Medium'}])
     report={'day':today(),'recs':recs[:5],'snapshot':{'views_7d':recent_views,'views_previous_7d':prior_views,'inquiries_7d':recent_inq,'bookings_7d':sumk(recent,'bookings'),'revenue_7d':sumk(recent,'revenue'),'competitor_reels_recent':len(new_reels),'distinct_competitors_recent':len({r['competitor_id'] for r in new_reels})},'method':'Rules-based analysis of imported data and manually entered, date-verified competitor Reel links. No automatic scraping.','demo':any(r['source']=='DEMO' for r in rows)}
     with db() as c:
         c.execute('INSERT INTO reports(workspace_id,day,data,created_at) VALUES(?,?,?,?) ON CONFLICT(workspace_id,day) DO UPDATE SET data=excluded.data, created_at=excluded.created_at',(wid,today(),json.dumps(report),utcnow()))
