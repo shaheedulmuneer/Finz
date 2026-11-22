@@ -235,3 +235,8 @@ footer{border-top-color:rgba(255,255,255,.07)}
 .pw-hint.hidden{display:none}
 #authSubmit:disabled{opacity:.7;cursor:wait}
 .auth-panel input:-webkit-autofill,.auth-panel input:-webkit-autofill:hover,.auth-panel input:-webkit-autofill:focus{-webkit-text-fill-color:#eff0f8;-webkit-box-shadow:0 0 0 1000px #101525 inset;caret-color:#eff0f8;transition:background-color 9999s}
+/* lowercase finz brand */
+.finz-brand{display:flex;align-items:center;gap:11px;margin:0 0 16px}
+.finz-brand img{width:46px;height:46px;display:block}
+.finz-brand span{font-family:Sora,Inter,sans-serif;font-weight:800;font-size:32px;letter-spacing:-1.5px;color:#F5C000;line-height:1}
+.logo strong{text-transform:none;color:#F5C000}
