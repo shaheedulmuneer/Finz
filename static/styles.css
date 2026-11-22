@@ -224,3 +224,14 @@ footer{border-top-color:rgba(255,255,255,.07)}
 .post-nums{display:flex;flex-wrap:wrap;gap:8px;font-size:11.5px;color:#aab0c8}
 .post-meta small{display:block;margin-top:6px;color:#7d84a0;font-size:11px}
 @media(max-width:600px){.post-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.post-meta p{font-size:12px}.post-nums{gap:6px;font-size:11px}}
+/* Sign-in polish */
+.finz-auth-logo{border-radius:14px}
+.social-btn.soon{opacity:.92}
+.pw-wrap{position:relative;display:block}
+.pw-wrap input{padding-right:70px!important}
+.pw-eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);margin-top:4px;border:0;background:#ffffff14;color:#cfd3e6;font:inherit;font-size:12px;font-weight:700;padding:6px 10px;border-radius:8px;cursor:pointer}
+.pw-eye:hover{background:#ffffff26}
+.pw-hint{margin:8px 0 0;color:#8a90a8;font-size:12px}
+.pw-hint.hidden{display:none}
+#authSubmit:disabled{opacity:.7;cursor:wait}
+.auth-panel input:-webkit-autofill,.auth-panel input:-webkit-autofill:hover,.auth-panel input:-webkit-autofill:focus{-webkit-text-fill-color:#eff0f8;-webkit-box-shadow:0 0 0 1000px #101525 inset;caret-color:#eff0f8;transition:background-color 9999s}
