@@ -368,11 +368,149 @@ def delete_reel(wid:int,rid:int,user=Depends(auth)):
 @app.get('/api/workspaces/{wid}/integrations')
 def integrations(wid:int,user=Depends(auth)):
     allow_workspace(wid,user)
-    return [{'name':'Instagram / Facebook','status':'Developer connection required','method':'Meta Graph API + OAuth','notes':'Professional account permissions and app review may apply.'},
-            {'name':'Google Business Profile','status':'Developer connection required','method':'Business Profile Performance API','notes':'Requires authorized business profile.'},
-            {'name':'TikTok','status':'Developer connection required','method':'TikTok APIs / business authorization','notes':'Access and allowed analytics depend on the product and permissions.'},
-            {'name':'WhatsApp Business','status':'Developer connection required','method':'WhatsApp Cloud API webhooks','notes':'Requires approved Meta business assets.'},
+    ig=get_connection(wid,'instagram')
+    if ig: igcard={'key':'instagram','name':'Instagram','status':'Connected','method':'@'+ig['account_name'] if ig['account_name'] else 'Connected account','notes':('Last synced '+ig['last_sync_at'][:16].replace('T',' ')+' UTC' if ig.get('last_sync_at') else 'Not synced yet')+(' · '+ig['last_sync_status'] if ig.get('last_sync_status') and ig['last_sync_status']!='OK' else ''),'action':'sync'}
+    elif ig_configured(): igcard={'key':'instagram','name':'Instagram','status':'Ready to connect','method':'Instagram Business Login','notes':'Connect your Instagram professional account to sync daily views, reach, likes, comments, shares and saves.','action':'connect'}
+    else: igcard={'key':'instagram','name':'Instagram','status':'Setup needed','method':'Instagram Business Login','notes':'Add INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET to the server settings to turn this on.','action':None}
+    return [igcard,
+            {'name':'Facebook Page','status':'Coming soon','method':'Facebook Login for Business','notes':'Page insights need a separate Facebook Login connection.'},
+            {'name':'Google Business Profile','status':'Coming soon','method':'Business Profile Performance API','notes':'Requires authorized business profile.'},
+            {'name':'TikTok','status':'Coming soon','method':'TikTok APIs / business authorization','notes':'Access and allowed analytics depend on the product and permissions.'},
+            {'name':'WhatsApp Business','status':'Coming soon','method':'WhatsApp Cloud API webhooks','notes':'Requires approved Meta business assets.'},
             {'name':'CSV import','status':'Ready','method':'Local file upload','notes':'Works now without external credentials.'}]
+
+# ===== Instagram connection (Business Login for Instagram) =====
+# Needs env vars: INSTAGRAM_APP_ID, INSTAGRAM_APP_SECRET. Optional: INSTAGRAM_REDIRECT_URI, TOKEN_ENCRYPTION_KEY.
+IG_GRAPH='https://graph.instagram.com/v25.0'
+IG_SCOPES='instagram_business_basic,instagram_business_manage_insights'
+def ig_configured(): return bool(os.environ.get('INSTAGRAM_APP_ID') and os.environ.get('INSTAGRAM_APP_SECRET'))
+def ig_redirect_uri(request:Request):
+    env=os.environ.get('INSTAGRAM_REDIRECT_URI','').strip()
+    if env: return env
+    host=request.headers.get('x-forwarded-host') or request.headers.get('host','')
+    return f'https://{host}/api/oauth/instagram/callback'
+def _fernet():
+    import base64
+    from cryptography.fernet import Fernet
+    raw=os.environ.get('TOKEN_ENCRYPTION_KEY') or ('finz-token-key:'+os.environ.get('INSTAGRAM_APP_SECRET',''))
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(raw.encode()).digest()))
+def seal(token:str)->str: return _fernet().encrypt(token.encode()).decode()
+def unseal(blob:str)->str: return _fernet().decrypt(blob.encode()).decode()
+def init_connection_tables():
+    with db() as c:
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS oauth_connections(id INTEGER PRIMARY KEY, workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE, provider TEXT NOT NULL, external_account_id TEXT NOT NULL, account_name TEXT NOT NULL DEFAULT '', token_enc TEXT NOT NULL, expires_at TEXT, last_sync_at TEXT, last_sync_status TEXT DEFAULT '', created_at TEXT NOT NULL, UNIQUE(workspace_id,provider));
+        CREATE TABLE IF NOT EXISTS oauth_states(state_hash TEXT PRIMARY KEY, workspace_id INTEGER NOT NULL, user_id INTEGER NOT NULL, provider TEXT NOT NULL, expires_at TEXT NOT NULL);
+        ''')
+init_connection_tables()
+def get_connection(wid:int,provider:str):
+    with db() as c:
+        r=c.execute('SELECT * FROM oauth_connections WHERE workspace_id=? AND provider=?',(wid,provider)).fetchone()
+        return dict(r) if r else None
+def ig_error(r):
+    try: msg=r.json().get('error',{}); msg=msg.get('message') if isinstance(msg,dict) else (r.json().get('error_message') or str(msg))
+    except Exception: msg=r.text[:200]
+    return f'Instagram said: {msg}'
+
+@app.get('/api/workspaces/{wid}/connect/instagram')
+def connect_instagram(wid:int,request:Request,user=Depends(auth)):
+    allow_workspace(wid,user)
+    if not ig_configured(): raise HTTPException(400,'Instagram is not set up yet. Add INSTAGRAM_APP_ID and INSTAGRAM_APP_SECRET to the server settings.')
+    state=secrets.token_urlsafe(32)
+    with db() as c:
+        c.execute('DELETE FROM oauth_states WHERE expires_at<?',(utcnow(),))
+        c.execute('INSERT INTO oauth_states(state_hash,workspace_id,user_id,provider,expires_at) VALUES(?,?,?,?,?)',(hashlib.sha256(state.encode()).hexdigest(),wid,user['id'],'instagram',(datetime.now(timezone.utc)+timedelta(minutes=15)).isoformat(timespec='seconds')))
+    from urllib.parse import urlencode
+    q=urlencode({'client_id':os.environ['INSTAGRAM_APP_ID'],'redirect_uri':ig_redirect_uri(request),'response_type':'code','scope':IG_SCOPES,'state':state})
+    return {'url':'https://www.instagram.com/oauth/authorize?'+q}
+
+@app.get('/api/oauth/instagram/callback',include_in_schema=False)
+def instagram_callback(request:Request,code:str='',state:str='',error:str='',error_description:str=''):
+    from fastapi.responses import RedirectResponse
+    from urllib.parse import quote
+    def back(msg=None): return RedirectResponse('/?connected=instagram' if not msg else '/?ig_error='+quote(msg[:200]),status_code=303)
+    if error: return back(error_description or 'Instagram connection was cancelled')
+    if not code or not state or not ig_configured(): return back('Missing code from Instagram')
+    with db() as c:
+        st=c.execute('SELECT * FROM oauth_states WHERE state_hash=? AND expires_at>?',(hashlib.sha256(state.encode()).hexdigest(),utcnow())).fetchone()
+        c.execute('DELETE FROM oauth_states WHERE state_hash=?',(hashlib.sha256(state.encode()).hexdigest(),))
+    if not st: return back('This connect link expired. Please try again.')
+    st=dict(st)
+    try:
+        r=httpx.post('https://api.instagram.com/oauth/access_token',data={'client_id':os.environ['INSTAGRAM_APP_ID'],'client_secret':os.environ['INSTAGRAM_APP_SECRET'],'grant_type':'authorization_code','redirect_uri':ig_redirect_uri(request),'code':code.split('#')[0]},timeout=20)
+        if r.status_code!=200: return back(ig_error(r))
+        short=r.json(); short=short['data'][0] if 'data' in short else short
+        r=httpx.get('https://graph.instagram.com/access_token',params={'grant_type':'ig_exchange_token','client_secret':os.environ['INSTAGRAM_APP_SECRET'],'access_token':short['access_token']},timeout=20)
+        if r.status_code!=200: return back(ig_error(r))
+        long=r.json(); token=long['access_token']; expires=(datetime.now(timezone.utc)+timedelta(seconds=int(long.get('expires_in',5184000)))).isoformat(timespec='seconds')
+        r=httpx.get(f'{IG_GRAPH}/me',params={'fields':'user_id,username','access_token':token},timeout=20)
+        if r.status_code!=200: return back(ig_error(r))
+        me=r.json()
+    except httpx.HTTPError: return back('Could not reach Instagram. Please try again.')
+    with db() as c:
+        c.execute('DELETE FROM oauth_connections WHERE workspace_id=? AND provider=?',(st['workspace_id'],'instagram'))
+        c.execute('INSERT INTO oauth_connections(workspace_id,provider,external_account_id,account_name,token_enc,expires_at,created_at) VALUES(?,?,?,?,?,?,?)',(st['workspace_id'],'instagram',str(me.get('user_id') or me.get('id')),me.get('username',''),seal(token),expires,utcnow()))
+    try: sync_instagram(st['workspace_id'])
+    except Exception: pass
+    return back()
+
+IG_DAY_METRICS=['reach','views','likes','comments','shares','saves','profile_links_taps']
+def sync_instagram(wid:int,days:int=30):
+    conn=get_connection(wid,'instagram')
+    if not conn: raise HTTPException(400,'Instagram is not connected')
+    token=unseal(conn['token_enc'])
+    # refresh the 60-day token when it has less than 10 days left
+    try:
+        if conn.get('expires_at') and datetime.fromisoformat(conn['expires_at'])-datetime.now(timezone.utc)<timedelta(days=10):
+            r=httpx.get('https://graph.instagram.com/refresh_access_token',params={'grant_type':'ig_refresh_token','access_token':token},timeout=20)
+            if r.status_code==200:
+                j=r.json(); token=j['access_token']
+                with db() as c: c.execute('UPDATE oauth_connections SET token_enc=?,expires_at=? WHERE id=?',(seal(token),(datetime.now(timezone.utc)+timedelta(seconds=int(j.get('expires_in',5184000)))).isoformat(timespec='seconds'),conn['id']))
+    except Exception: pass
+    tz=ZoneInfo('Asia/Dubai'); rows=[]; errors=[]
+    def one(params):
+        try:
+            r=httpx.get(f"{IG_GRAPH}/{conn['external_account_id']}/insights",params={**params,'period':'day','metric_type':'total_value','access_token':token},timeout=20)
+            if r.status_code!=200: return None,ig_error(r)
+            return {x.get('name'):int((x.get('total_value') or {}).get('value',0)) for x in r.json().get('data',[])},None
+        except httpx.HTTPError as e: return None,str(e)
+    def fetch_day(i):
+        d=local_date()-timedelta(days=i)
+        since=int(datetime(d.year,d.month,d.day,tzinfo=tz).timestamp()); win={'since':since,'until':since+86400}
+        vals,err=one({**win,'metric':','.join(IG_DAY_METRICS)})
+        errs=[]
+        if vals is None:  # one metric was refused: fall back to asking one by one
+            vals={}
+            for m in IG_DAY_METRICS:
+                v,e=one({**win,'metric':m})
+                if v: vals.update(v)
+                elif e: errs.append(e)
+        return d,vals,errs
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for d,vals,errs in ex.map(fetch_day,range(1,days+1)):
+            errors+=errs
+            if vals: rows.append((wid,d.isoformat(),'Instagram','Instagram daily total',vals.get('views',0),vals.get('reach',0),vals.get('likes',0),vals.get('comments',0),vals.get('shares',0),vals.get('saves',0),vals.get('profile_links_taps',0),0,0,0,'INSTAGRAM_API',utcnow()))
+    if not rows:
+        msg=errors[0] if errors else 'No data returned'
+        with db() as c: c.execute('UPDATE oauth_connections SET last_sync_at=?,last_sync_status=? WHERE id=?',(utcnow(),'Error: '+msg[:180],conn['id']))
+        raise HTTPException(502,msg)
+    with db() as c:
+        c.execute('DELETE FROM metrics WHERE workspace_id=? AND source=? AND day>=?',(wid,'INSTAGRAM_API',(local_date()-timedelta(days=days)).isoformat()))
+        c.executemany('''INSERT INTO metrics(workspace_id,day,platform,post_title,views,reach,likes,comments,shares,saves,profile_visits,inquiries,bookings,revenue,source,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',rows)
+        c.execute('UPDATE oauth_connections SET last_sync_at=?,last_sync_status=? WHERE id=?',(utcnow(),'OK' if not errors else 'Partly synced',conn['id']))
+    return {'days':len(rows),'warnings':errors[:3]}
+
+@app.post('/api/workspaces/{wid}/sync/instagram')
+def sync_instagram_now(wid:int,user=Depends(auth)):
+    allow_workspace(wid,user)
+    return sync_instagram(wid)
+
+@app.delete('/api/workspaces/{wid}/connections/instagram')
+def disconnect_instagram(wid:int,user=Depends(auth)):
+    allow_workspace(wid,user)
+    with db() as c: c.execute('DELETE FROM oauth_connections WHERE workspace_id=? AND provider=?',(wid,'instagram'))
+    return {'ok':True}
 
 def create_report(wid:int):
     with db() as c:
