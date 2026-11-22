@@ -450,7 +450,7 @@ def health():
 
 app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 @app.get('/')
-def homepage():return FileResponse(ROOT/'static'/'index.html')
+def homepage():return FileResponse(ROOT/'static'/'index.html',headers={'Cache-Control':'no-cache, no-store, must-revalidate'})
 
 @app.get('/download',include_in_schema=False)
 def downloads():
